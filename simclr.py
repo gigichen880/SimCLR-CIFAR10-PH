@@ -81,10 +81,23 @@ def get_color_distortion(s=0.5):  # 0.5 for CIFAR10 by default
     return color_distort
 
 
-@hydra.main(config_path='simclr_config.yml')
+# @hydra.main(config_path='simclr_config.yml')
+# def train(args: DictConfig) -> None:
+
+@hydra.main(version_base=None, config_path=".", config_name="simclr_config")
 def train(args: DictConfig) -> None:
-    assert torch.cuda.is_available()
-    cudnn.benchmark = True
+    # assert torch.cuda.is_available()
+    # cudnn.benchmark = True
+    device = (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    print(f"[SimCLR] using device = {device}")
+
+    # Only helps on CUDA
+    if device == "cuda":
+        cudnn.benchmark = True
 
     train_transform = transforms.Compose([transforms.RandomResizedCrop(32),
                                           transforms.RandomHorizontalFlip(p=0.5),
@@ -105,7 +118,7 @@ def train(args: DictConfig) -> None:
     # Prepare model
     assert args.backbone in ['resnet18', 'resnet34']
     base_encoder = eval(args.backbone)
-    model = SimCLR(base_encoder, projection_dim=args.projection_dim).cuda()
+    model = SimCLR(base_encoder, projection_dim=args.projection_dim).to(device)
     logger.info('Base model: {}'.format(args.backbone))
     logger.info('feature dim: {}, projection dim: {}'.format(model.feature_dim, args.projection_dim))
 
@@ -132,7 +145,7 @@ def train(args: DictConfig) -> None:
         train_bar = tqdm(train_loader)
         for x, y in train_bar:
             sizes = x.size()
-            x = x.view(sizes[0] * 2, sizes[2], sizes[3], sizes[4]).cuda(non_blocking=True)
+            x = x.view(sizes[0] * 2, sizes[2], sizes[3], sizes[4]).to(device, non_blocking=(device == "cuda"))
 
             optimizer.zero_grad()
             feature, rep = model(x)
