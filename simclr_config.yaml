@@ -15,25 +15,30 @@ data_dir: data
 
 # model
 backbone: resnet18 # or resnet34, resnet50
-projection_dim: 128 # "[...] to project the representation to a 128-dimensional latent space"
+# projection_dim: 128 # "[...] to project the representation to a 128-dimensional latent space"
+projection_dim: 64
 
 # train options
 
 seed: 42 # sacred handles automatic seeding when passed in the config
-batch_size: 512
-workers: 16
-epochs: 1000
-log_interval: 50
-
+# batch_size: 512
+# workers: 16
+# epochs: 1000
+# log_interval: 50
+batch_size: 64
+workers: 0
+epochs: 5
+log_interval: 1
 
 # loss options
 optimizer: 'sgd' # or LARS (experimental)
-learning_rate: 0.6 # initial lr = 0.3 * batch_size / 256
+# learning_rate: 0.6 # initial lr = 0.3 * batch_size / 256
+learning_rate: 0.3
 momentum: 0.9
 weight_decay: 1.0e-6 # "optimized using LARS [...] and weight decay of 10−6"
 temperature: 0.5 # see appendix B.7.: Optimal temperature under different batch sizes
 
 
 # finetune options
-finetune_epochs: 100
-load_epoch: 1000  # checkpoint for finetune
+finetune_epochs: 5
+load_epoch: 5  # checkpoint for finetune

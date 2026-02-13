@@ -16,7 +16,7 @@ from torchvision import transforms
 
 from models import SimCLR
 from tqdm import tqdm
-
+from torch.utils.data import Subset
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,7 @@ def train(args: DictConfig) -> None:
                             train=True,
                             transform=train_transform,
                             download=True)
+    train_set = Subset(train_set, range(5000))
 
     train_loader = DataLoader(train_set,
                               batch_size=args.batch_size,
@@ -143,7 +144,10 @@ def train(args: DictConfig) -> None:
     for epoch in range(1, args.epochs + 1):
         loss_meter = AverageMeter("SimCLR_loss")
         train_bar = tqdm(train_loader)
-        for x, y in train_bar:
+        max_steps = 50
+        for step, (x, y) in enumerate(train_bar):
+            if step >= max_steps:
+                break
             sizes = x.size()
             x = x.view(sizes[0] * 2, sizes[2], sizes[3], sizes[4]).to(device, non_blocking=(device == "cuda"))
 
