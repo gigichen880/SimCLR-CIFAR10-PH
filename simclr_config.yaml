@@ -1,44 +1,98 @@
-hydra:
-  job_logging:
-#    formatters:
-#      simple:
-#        format: '[]'
-    root:
-      handlers: [file, console]  # logging to file only.
-  run:
-    #dir: logs/${dataset}
-    dir: logs/SimCLR/${dataset}
+# hydra:
+#   job_logging:
+# #    formatters:
+# #      simple:
+# #        format: '[]'
+#     root:
+#       handlers: [file, console]  # logging to file only.
+#   run:
+#     #dir: logs/${dataset}
+#     dir: logs/SimCLR/${dataset}
 
 
-dataset: cifar10
-data_dir: data
+# dataset: cifar10
+# data_dir: data
 
-# model
-backbone: resnet18 # or resnet34, resnet50
-# projection_dim: 128 # "[...] to project the representation to a 128-dimensional latent space"
-projection_dim: 64
+# # model
+# backbone: resnet18 # or resnet34, resnet50
+# # projection_dim: 128 # "[...] to project the representation to a 128-dimensional latent space"
+# projection_dim: 64
 
-# train options
+# # train options
 
-seed: 42 # sacred handles automatic seeding when passed in the config
-# batch_size: 512
-# workers: 16
-# epochs: 1000
-# log_interval: 50
-batch_size: 64
-workers: 0
-epochs: 5
-log_interval: 1
+# seed: 42 # sacred handles automatic seeding when passed in the config
+# # batch_size: 512
+# # workers: 16
+# # epochs: 1000
+# # log_interval: 50
+# batch_size: 64
+# workers: 0
+# epochs: 5
+# log_interval: 1
 
-# loss options
-optimizer: 'sgd' # or LARS (experimental)
-# learning_rate: 0.6 # initial lr = 0.3 * batch_size / 256
+# # loss options
+# optimizer: 'sgd' # or LARS (experimental)
+# # learning_rate: 0.6 # initial lr = 0.3 * batch_size / 256
+# learning_rate: 0.3
+# momentum: 0.9
+# weight_decay: 1.0e-6 # "optimized using LARS [...] and weight decay of 10−6"
+# temperature: 0.5 # see appendix B.7.: Optimal temperature under different batch sizes
+
+
+# # finetune options
+# finetune_epochs: 5
+# load_epoch: 5  # checkpoint for finetune
+
+
+# NEW
+
+# simclr_config.yaml
+
+data_dir: ./data
+backbone: resnet18
+batch_size: 128
+workers: 2
+epochs: 10
+log_interval: 5
 learning_rate: 0.3
 momentum: 0.9
-weight_decay: 1.0e-6 # "optimized using LARS [...] and weight decay of 10−6"
-temperature: 0.5 # see appendix B.7.: Optimal temperature under different batch sizes
+weight_decay: 1e-6
+temperature: 0.5
+projection_dim: 64
+seed: 0
 
+# Choose: baseline | hybrid | teacher
+method: baseline
 
-# finetune options
-finetune_epochs: 5
-load_epoch: 5  # checkpoint for finetune
+train:
+  max_steps: 50   # set -1 for full epoch
+
+optim:
+  lr_min: 1e-3
+
+aug:
+  color_strength: 0.5
+
+data:
+  subset_size: 5000
+
+model:
+  proj_hidden_dim: 512
+
+ph:
+  reduce_channels: 8    # helps remove ripser warning (#dims <= #points)
+  num_points: 25        # subsample spatial points (speed)
+  pi_grid: 12
+  pi_sigma: 0.15
+  birth_min: 0.0
+  birth_max: 4.0
+  pers_min: 0.0
+  pers_max: 4.0
+
+loss:
+  # for hybrid
+  alpha: 0.9
+
+  # for teacher
+  teacher_temperature: 0.5
+  student_temperature: 0.5
