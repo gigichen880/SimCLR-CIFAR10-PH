@@ -1,3 +1,4 @@
+# simclr_config.yaml
 # ==============================
 # SimCLR + PH Configuration
 # ==============================
@@ -28,7 +29,8 @@ method: baseline
 # ==============================
 
 train:
-  max_steps: 50   # set -1 for full epoch
+  max_steps: 50        # set -1 for full epoch
+  warmup_epochs: 2     # baseline warmup even if method=phsim/hybrid
 
 optim:
   lr_min: 1e-3
@@ -37,7 +39,7 @@ aug:
   color_strength: 0.5
 
 data:
-  subset_size: 5000   # set -1 for full CIFAR
+  subset_size: 5000    # set -1 for full CIFAR
 
 model:
   proj_hidden_dim: 512
@@ -64,10 +66,12 @@ loss:
   # for hybrid (baseline + phsim)
   alpha: 0.9
 
-  # for phsim (PH-guided contrastive)
-  # (we reuse these temperature names)
-  teacher_temperature: 0.5   # PH soft-target temperature
-  student_temperature: 0.5   # rep similarity temperature
+  # for phsim / hybrid
+  teacher_temperature: 0.3   # PH soft-target temperature (sharper targets help)
+  student_temperature: 0.2   # rep similarity temperature
+
+  ph_topk: 20                # top-k neighbors for PH targets (0 disables)
+  ph_proj_align: 0.05        # similarity alignment weight (0 disables)
 
 # ==============================
 # Linear evaluation

@@ -2,7 +2,5 @@ __pycache__/
 logs/
 data/
 outputs/
-*.pt
 *.csv
-*.png
 *.pth

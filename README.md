@@ -28,7 +28,20 @@ simclr_config.yml   # Config File with all default hyperparameters in training.
 
 Train SimCLR with  ``resnet18`` as backbone:
 
-``python simclr.py backbone=resnet18``
+### 1) Baseline SimCLR
+``
+python simclr.py method=baseline backbone=resnet18
+``
+
+### 2) PH-Guided Contrastive (PHsim)
+``
+python simclr.py method=phsim backbone=resnet18
+``
+
+### 3) Hybrid
+``
+python simclr.py method=hybrid loss.alpha=0.9 backbone=resnet18
+``
 
 Linear evaluation:
 
