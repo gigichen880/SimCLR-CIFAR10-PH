@@ -1,18 +1,30 @@
 """
-simclr.py
+simclr.py (end-to-end updated)
 
-Supports 3 training methods controlled by yaml / CLI:
+Goal:
+- Use Persistent Homology (PH) ONLY to define a similarity / neighborhood structure.
+- Train the backbone with gradient descent by matching rep-similarities to PH-defined soft targets.
+- We do NOT backprop through PH itself.
+
+Methods (yaml / CLI):
   - method=baseline : standard SimCLR NT-Xent on rep
-  - method=hybrid   : alpha*SimCLR + (1-alpha)*PH-NTXent (PH via ripser on CPU; stop-grad)
-  - method=teacher  : PH-as-teacher similarity matching (KL) where PH sim is the target,
-                      and rep sim is the student (backbone trains; PH computed on CPU)
+  - method=phsim    : PH-guided contrastive (PH defines soft positives; reps learn them)
+  - method=hybrid   : alpha*baseline + (1-alpha)*phsim
 
 Run examples:
   python simclr.py backbone=resnet18 method=baseline
+  python simclr.py backbone=resnet18 method=phsim
   python simclr.py backbone=resnet18 method=hybrid loss.alpha=0.9
-  python simclr.py backbone=resnet18 method=teacher
 
+Notes:
+- Uses ripser (CPU) for PH (robust on VMs); PH is detached.
+- For CIFAR, we remove ResNet maxpool in stem to avoid 1x1 feature maps (PH needs >1 point).
+- Saves train_history.csv, loss_curve.png, lr_curve.png into Hydra run dir.
 """
+
+import os
+import csv
+import matplotlib.pyplot as plt
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -21,7 +33,7 @@ import logging
 import numpy as np
 from PIL import Image
 from ripser import ripser
-from torchph.pershom import vr_persistence_l1
+from models import SimCLR
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -36,8 +48,10 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Optional: keep warnings quieter
 import warnings
 warnings.simplefilter("ignore", UserWarning)
+
 
 # -------------------------
 # Utilities
@@ -59,6 +73,50 @@ class AverageMeter(object):
         self.sum += float(val) * n
         self.count += n
         self.avg = self.sum / max(1, self.count)
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+class HistoryLogger:
+    def __init__(self, out_dir: str, filename: str = "train_history.csv"):
+        self.out_dir = out_dir
+        ensure_dir(out_dir)
+        self.csv_path = os.path.join(out_dir, filename)
+        self.rows = []
+        with open(self.csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "loss", "lr"])
+
+    def log_epoch(self, epoch: int, loss: float, lr: float):
+        self.rows.append((epoch, loss, lr))
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([epoch, loss, lr])
+
+    def plot(self):
+        if not self.rows:
+            return
+        epochs = [r[0] for r in self.rows]
+        losses = [r[1] for r in self.rows]
+        lrs = [r[2] for r in self.rows]
+
+        plt.figure()
+        plt.plot(epochs, losses)
+        plt.xlabel("epoch")
+        plt.ylabel("train loss")
+        plt.title("Train Loss")
+        plt.savefig(os.path.join(self.out_dir, "loss_curve.png"), dpi=150)
+        plt.close()
+
+        plt.figure()
+        plt.plot(epochs, lrs)
+        plt.xlabel("epoch")
+        plt.ylabel("learning rate")
+        plt.title("Learning Rate")
+        plt.savefig(os.path.join(self.out_dir, "lr_curve.png"), dpi=150)
+        plt.close()
 
 
 class CIFAR10Pair(CIFAR10):
@@ -88,59 +146,13 @@ def get_color_distortion(s=0.5):
     rnd_gray = transforms.RandomGrayscale(p=0.2)
     return transforms.Compose([rnd_color_jitter, rnd_gray])
 
-
 # -------------------------
-# Model: ResNet backbone that exposes pre-pool feature map
-# -------------------------
-class SimCLR(nn.Module):
-    """
-    Returns:
-      h_map_small: (B, c_small, H, W)   pre-global-pool map (channel reduced)
-      h:          (B, C)               pooled backbone feature
-      rep:        (B, proj_dim)        projection head output
-    """
-    def __init__(self, base_encoder_fn, projection_dim=128, proj_hidden_dim=512, reduce_channels=8):
-        super().__init__()
-        backbone = base_encoder_fn(weights=None)
-
-        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
-        self.avgpool = backbone.avgpool
-
-        self.feature_dim = backbone.fc.in_features  # e.g. 512 for resnet18
-
-        self.projector = nn.Sequential(
-            nn.Linear(self.feature_dim, proj_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_hidden_dim, projection_dim),
-        )
-
-        self.ph_reduce = nn.Conv2d(self.feature_dim, reduce_channels, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        h_map = self.layer4(x)               # (B, C, H, W)  <-- pre-global pooling
-        h_map_small = self.ph_reduce(h_map)  # (B, c_small, H, W)
-
-        h = self.avgpool(h_map)              # (B, C, 1, 1)
-        h = torch.flatten(h, 1)              # (B, C)
-        rep = self.projector(h)              # (B, proj_dim)
-        return h_map_small, h, rep
-
-
-# -------------------------
-# PH featurizer (CPU ripser; stop-grad)
+# PH featurizer (ripser CPU; detached)
 # -------------------------
 class SoftPersistenceImage(nn.Module):
     """
     Diagram -> fixed vector via Gaussian bumps on (birth, persistence) grid.
-    NOTE: If ripser yields death=inf, we filter those points.
+    Filters inf/NaN points.
     """
     def __init__(self, grid_size=12, birth_range=(0.0, 4.0), pers_range=(0.0, 4.0), sigma=0.15):
         super().__init__()
@@ -152,17 +164,14 @@ class SoftPersistenceImage(nn.Module):
         b = torch.linspace(self.birth_min, self.birth_max, grid_size)
         p = torch.linspace(self.pers_min, self.pers_max, grid_size)
         bb, pp = torch.meshgrid(b, p, indexing="ij")
-        centers = torch.stack([bb.reshape(-1), pp.reshape(-1)], dim=1)  # (G, 2)
+        centers = torch.stack([bb.reshape(-1), pp.reshape(-1)], dim=1)  # (G,2)
         self.register_buffer("centers", centers)
 
     def forward(self, diagram_bd: torch.Tensor) -> torch.Tensor:
-        """
-        diagram_bd: (M,2) (birth, death)
-        returns: (G,) persistence image feature
-        """
+        if diagram_bd.numel() == 0:
+            return diagram_bd.new_zeros(self.centers.shape[0])
 
-        # Drop inf deaths (essential classes) + any NaNs
-        mask = torch.isfinite(diagram_bd).all(dim=1) & torch.isfinite(diagram_bd[:, 1])
+        mask = torch.isfinite(diagram_bd).all(dim=1)
         diagram_bd = diagram_bd[mask]
         if diagram_bd.numel() == 0:
             return diagram_bd.new_zeros(self.centers.shape[0])
@@ -171,28 +180,24 @@ class SoftPersistenceImage(nn.Module):
         death = diagram_bd[:, 1]
         pers = (death - birth).clamp(min=0.0)
 
-        # Convert to (birth, persistence)
         pts = torch.stack([birth, pers], dim=1)  # (M,2)
 
         diff = pts[:, None, :] - self.centers[None, :, :]  # (M,G,2)
         dist2 = (diff ** 2).sum(dim=2)                     # (M,G)
         bumps = torch.exp(-dist2 / (2 * self.sigma * self.sigma))  # (M,G)
 
-        weights = pers[:, None]  # weight by persistence
-        feat = (bumps * weights).sum(dim=0)  # (G,)
+        feat = (bumps * pers[:, None]).sum(dim=0)  # (G,)
         return feat
 
 
 class PHFeaturizer(nn.Module):
     """
-    Pre-pool map -> point cloud -> ripser diagrams -> persistence-image -> projected vector.
-
-    ripser is CPU + non-differentiable, so this is stop-grad w.r.t the CNN.
+    feature map -> point cloud -> ripser diagrams -> persistence image -> projected PH vector
     """
     def __init__(
         self,
         out_dim=128,
-        num_points=16,
+        num_points=25,
         pi_grid=12,
         sigma=0.15,
         birth_range=(0.0, 4.0),
@@ -212,7 +217,7 @@ class PHFeaturizer(nn.Module):
         self.proj = nn.Linear(2 * raw_dim, out_dim)  # concat(H0 PI, H1 PI)
 
     def _to_pointcloud(self, h_map_small: torch.Tensor) -> torch.Tensor:
-        # h_map_small: (B, c_small, H, W) -> (B, N, c_small)
+        # (B,C,H,W) -> (B, N, C) where N=H*W
         B, C, H, W = h_map_small.shape
         pts = h_map_small.permute(0, 2, 3, 1).reshape(B, H * W, C)
         N = H * W
@@ -228,26 +233,17 @@ class PHFeaturizer(nn.Module):
         return x.astype(np.float32)
 
     def _vr_persistence(self, pts: torch.Tensor, hom_dim: int) -> torch.Tensor:
-        """
-        pts: (N, C) torch tensor for ONE sample (CUDA)
-        returns: (M, 2) torch tensor (birth, death) on pts.device
-        """
-        # IMPORTANT: torchph expects float32 on GPU
-        pts = pts.float()
+        pts_np = pts.detach().cpu().numpy().astype(np.float32)
+        pts_np = self._standardize_np(pts_np)
 
-        # vr_persistence_l1 returns a nested structure; we index out the diagram tensor.
-        # Pattern used in torchph examples: out[0][0] gives (M,2) diagram
-        out = vr_persistence_l1(pts, hom_dim, 0)
-        dgm = out[0][0]  # (M,2) birth/death
-
-        # safety: empty handling
-        if dgm.numel() == 0:
+        dgms = ripser(pts_np, maxdim=1)["dgms"]
+        dgm = dgms[hom_dim]
+        if dgm.size == 0:
             return pts.new_zeros((0, 2))
-
-        return dgm
+        return torch.from_numpy(dgm).to(device=pts.device, dtype=pts.dtype)
 
     def forward(self, h_map_small: torch.Tensor) -> torch.Tensor:
-        pts_batch = self._to_pointcloud(h_map_small)  # (B, N, C)
+        pts_batch = self._to_pointcloud(h_map_small)  # (B,N,C)
         feats = []
         for b in range(pts_batch.size(0)):
             pts = pts_batch[b]
@@ -261,9 +257,8 @@ class PHFeaturizer(nn.Module):
             feats.append(torch.cat([f0, f1], dim=0))
 
         feats = torch.stack(feats, dim=0)  # (B, 2*raw_dim)
-        # stabilize magnitude going into proj
         feats = feats / (feats.norm(dim=1, keepdim=True) + 1e-8)
-        return self.proj(feats)  # (B, out_dim)
+        return self.proj(feats)            # (B, out_dim)
 
 
 # -------------------------
@@ -281,20 +276,6 @@ def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
     return F.cross_entropy(sim, targets.long())
 
 
-def ph_nt_xent(h_map_small: torch.Tensor, ph_featurizer: nn.Module, t=0.5) -> torch.Tensor:
-    ph_vec = ph_featurizer(h_map_small)  # (2B, d)
-    ph_vec = ph_vec / (ph_vec.norm(dim=1, keepdim=True) + 1e-8)
-
-    sim = (ph_vec @ ph_vec.t()).clamp(min=1e-7)
-    sim = sim / t
-    sim = sim - torch.eye(sim.size(0), device=sim.device) * 1e5
-
-    targets = torch.arange(sim.size(0), device=sim.device)
-    targets[::2] += 1
-    targets[1::2] -= 1
-    return F.cross_entropy(sim, targets.long())
-
-
 def sim_matrix(x: torch.Tensor, t=0.5) -> torch.Tensor:
     x = x / (x.norm(dim=1, keepdim=True) + 1e-8)
     s = (x @ x.t()).clamp(min=1e-7)
@@ -303,14 +284,36 @@ def sim_matrix(x: torch.Tensor, t=0.5) -> torch.Tensor:
     return s
 
 
-def kl_match_loss(student_sim: torch.Tensor, teacher_sim: torch.Tensor) -> torch.Tensor:
+def _soft_targets_from_sim(sim_logits: torch.Tensor, tau: float) -> torch.Tensor:
     """
-    KL( teacher || student ) over row-wise softmax distributions.
-    teacher is detached (fixed target).
+    sim_logits: (N,N) higher means more similar. diagonal should already be masked/very negative.
+    Returns row-stochastic soft target distribution.
     """
-    p = F.softmax(teacher_sim, dim=1).detach()
-    logq = F.log_softmax(student_sim, dim=1)
-    return F.kl_div(logq, p, reduction="batchmean")
+    N = sim_logits.size(0)
+    mask = ~torch.eye(N, dtype=torch.bool, device=sim_logits.device)
+    logits = (sim_logits / tau).masked_fill(~mask, -1e9)
+    return F.softmax(logits, dim=1)
+
+
+def ph_guided_contrastive(rep: torch.Tensor, ph_vec: torch.Tensor, tau_student: float, tau_ph: float) -> torch.Tensor:
+    """
+    PH defines soft neighbors; rep learns to match them via cross-entropy.
+    rep: (N,d) differentiable
+    ph_vec: (N,d') treated as constant target (no grad)
+    """
+    # Student logits (differentiable)
+    S_rep = sim_matrix(rep, t=tau_student)
+
+    # PH targets (no grad)
+    with torch.no_grad():
+        ph_vec = ph_vec / (ph_vec.norm(dim=1, keepdim=True) + 1e-8)
+        S_ph = (ph_vec @ ph_vec.t()).clamp(min=1e-7)
+        S_ph = S_ph - torch.eye(S_ph.size(0), device=S_ph.device) * 1e5
+        P_ph = _soft_targets_from_sim(S_ph, tau=tau_ph)
+
+    logQ = F.log_softmax(S_rep, dim=1)
+    loss = -(P_ph * logQ).sum(dim=1).mean()
+    return loss
 
 
 # -------------------------
@@ -318,10 +321,8 @@ def kl_match_loss(student_sim: torch.Tensor, teacher_sim: torch.Tensor) -> torch
 # -------------------------
 @hydra.main(version_base=None, config_path=".", config_name="simclr_config")
 def train(args: DictConfig) -> None:
-    # Log config for reproducibility
     logger.info("Config:\n" + OmegaConf.to_yaml(args))
 
-    # Device
     device = (
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
@@ -331,10 +332,13 @@ def train(args: DictConfig) -> None:
     if device == "cuda":
         cudnn.benchmark = True
 
-    # Seed
     seed = int(getattr(args, "seed", 0))
     if seed:
         set_seed(seed)
+
+    # Hydra run dir
+    out_dir = os.getcwd()
+    hist = HistoryLogger(out_dir)
 
     # Data
     train_transform = transforms.Compose([
@@ -367,9 +371,10 @@ def train(args: DictConfig) -> None:
         projection_dim=int(args.projection_dim),
         proj_hidden_dim=int(args.model.proj_hidden_dim),
         reduce_channels=int(args.ph.reduce_channels),
+        cifar_no_maxpool=True,   # IMPORTANT for PH on CIFAR
     ).to(device)
 
-    # PH featurizer
+    # PH featurizer (PH is computed by ripser on CPU; projection head is learnable but PH path is detached)
     ph_featurizer = PHFeaturizer(
         out_dim=int(args.projection_dim),
         num_points=int(args.ph.num_points),
@@ -383,9 +388,9 @@ def train(args: DictConfig) -> None:
     logger.info(f"feature dim: {model.feature_dim}, projection dim: {args.projection_dim}")
     logger.info(f"method: {args.method}")
 
-    # Optimizer
+    # Optimizer: train backbone+projector AND the PH projection head
     optimizer = torch.optim.SGD(
-        list(model.parameters()) + list(ph_featurizer.parameters()),
+        list(model.parameters()) + list(ph_featurizer.proj.parameters()),
         float(args.learning_rate),
         momentum=float(args.momentum),
         weight_decay=float(args.weight_decay),
@@ -399,12 +404,15 @@ def train(args: DictConfig) -> None:
         lr_lambda=lambda step: get_lr(step, total_steps, float(args.learning_rate), float(args.optim.lr_min))
     )
 
-    # Training
     model.train()
     ph_featurizer.train()
 
     max_steps = int(args.train.max_steps) if int(args.train.max_steps) > 0 else None
     temperature = float(args.temperature)
+
+    # For PH-guided: use these temps (still in config.loss for convenience)
+    tau_ph = float(args.loss.teacher_temperature)     # PH soft-target sharpness
+    tau_student = float(args.loss.student_temperature)  # rep logits temperature
 
     for epoch in range(1, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
@@ -414,7 +422,6 @@ def train(args: DictConfig) -> None:
             if max_steps is not None and step >= max_steps:
                 break
 
-            # x: (B,2,C,H,W) -> (2B,C,H,W)
             B = x.size(0)
             x = x.view(B * 2, x.size(2), x.size(3), x.size(4)).to(device, non_blocking=(device == "cuda"))
 
@@ -426,25 +433,21 @@ def train(args: DictConfig) -> None:
             if method == "baseline":
                 loss = nt_xent(rep, temperature)
 
+            elif method == "phsim":
+                # PH defines similarity; reps learn to match PH neighborhoods
+                ph_vec = ph_featurizer(h_map_small)
+                loss = ph_guided_contrastive(rep=rep, ph_vec=ph_vec, tau_student=tau_student, tau_ph=tau_ph)
+
             elif method == "hybrid":
+                # baseline + PH-guided contrastive
                 alpha = float(args.loss.alpha)
                 loss_cos = nt_xent(rep, temperature)
-                loss_ph = ph_nt_xent(h_map_small, ph_featurizer, temperature)
-                loss = alpha * loss_cos + (1.0 - alpha) * loss_ph
-
-            elif method == "teacher":
-                # teacher sim from PH (CPU ripser inside featurizer), student sim from rep (differentiable)
-                teacher_tau = float(args.loss.teacher_temperature)
-                student_tau = float(args.loss.student_temperature)
-
                 ph_vec = ph_featurizer(h_map_small)
-                S_ph = sim_matrix(ph_vec, teacher_tau)
-
-                S_rep = sim_matrix(rep, student_tau)
-                loss = kl_match_loss(S_rep, S_ph)
+                loss_phsim = ph_guided_contrastive(rep=rep, ph_vec=ph_vec, tau_student=tau_student, tau_ph=tau_ph)
+                loss = alpha * loss_cos + (1.0 - alpha) * loss_phsim
 
             else:
-                raise ValueError(f"Unknown method={args.method}. Use baseline|hybrid|teacher.")
+                raise ValueError(f"Unknown method={args.method}. Use baseline|phsim|hybrid.")
 
             loss.backward()
             optimizer.step()
@@ -463,6 +466,11 @@ def train(args: DictConfig) -> None:
             path = f"simclr_{args.method}_{args.backbone}_epoch{epoch}.pt"
             logger.info(f"==> Save checkpoint: {path}")
             torch.save(ckpt, path)
+
+        # End-of-epoch logging + plots
+        current_lr = optimizer.param_groups[0]["lr"]
+        hist.log_epoch(epoch, loss_meter.avg, current_lr)
+        hist.plot()
 
 
 if __name__ == "__main__":

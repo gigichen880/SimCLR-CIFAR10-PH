@@ -3,3 +3,6 @@ logs/
 data/
 outputs/
 *.pt
+*.csv
+*.png
+*.pth
