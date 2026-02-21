@@ -78,7 +78,7 @@ class HistoryLogger:
             w = csv.writer(f)
             w.writerow([epoch, train_loss, train_acc, test_loss, test_acc, lr])
 
-    def plot(self):
+    def plot(self, tag):
         if not self.rows:
             return
         epochs = [r[0] for r in self.rows]
@@ -94,7 +94,7 @@ class HistoryLogger:
         plt.ylabel("loss")
         plt.title("Linear Eval Loss")
         plt.legend()
-        plt.savefig(os.path.join(self.out_dir, "lin_loss_curve.png"), dpi=150)
+        plt.savefig(os.path.join(self.out_dir, f"lin_loss_{tag}.png"), dpi=150)
         plt.close()
 
         plt.figure()
@@ -104,7 +104,7 @@ class HistoryLogger:
         plt.ylabel("accuracy")
         plt.title("Linear Eval Accuracy")
         plt.legend()
-        plt.savefig(os.path.join(self.out_dir, "lin_acc_curve.png"), dpi=150)
+        plt.savefig(os.path.join(self.out_dir, f"lin_acc_{tag}.png"), dpi=150)
         plt.close()
 
 
@@ -211,7 +211,14 @@ def finetune(args: DictConfig) -> None:
 
     # Hydra run dir for outputs
     out_dir = os.getcwd()
-    hist = HistoryLogger(out_dir)
+
+    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    viz_dir = os.path.join(out_dir, "visualizations")
+
+    ensure_dir(ckpt_dir)
+    ensure_dir(viz_dir)
+
+    hist = HistoryLogger(viz_dir)
 
     # Simple transforms for linear eval (common practice: light aug on train, standard on test)
     train_transform = transforms.Compose([
@@ -258,7 +265,7 @@ def finetune(args: DictConfig) -> None:
     ).to(device)
 
     # Load checkpoint produced by simclr.py
-    ckpt_path = f"simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
+    ckpt_path = f"checkpoints/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -319,14 +326,19 @@ def finetune(args: DictConfig) -> None:
         test_loss, test_acc = run_epoch(model, test_loader, epoch, device)
 
         current_lr = optimizer.param_groups[0]["lr"]
+        tag = f"{args.method}_{args.backbone}_bs{args.batch_size}"
+        if int(args.seed) != 0:
+            tag += f"_seed{args.seed}"
         hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, current_lr)
-        hist.plot()
+        hist.plot(tag=tag)
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
             best_epoch = epoch
             logger.info("==> New best test acc")
-            torch.save(model.state_dict(), f"simclr_lin_{args.method}_{args.backbone}_best.pth")
+            best_name = f"simclr_lin_{tag}_best.pth"
+            best_path = os.path.join(ckpt_dir, best_name)
+            torch.save(model.state_dict(), best_path)
 
     logger.info(f"Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")
 
