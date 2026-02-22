@@ -213,12 +213,12 @@ def finetune(args: DictConfig) -> None:
     out_dir = os.getcwd()
 
     ckpt_dir = os.path.join(out_dir, "checkpoints")
-    viz_dir = os.path.join(out_dir, "visualizations")
+    viz_dir = os.path.join(out_dir, "visuals")
 
     ensure_dir(ckpt_dir)
     ensure_dir(viz_dir)
 
-    hist = HistoryLogger(viz_dir)
+    hist = HistoryLogger(viz_dir, filename=f"lin_history_{args.method}_{args.backbone}.csv")
 
     # Simple transforms for linear eval (common practice: light aug on train, standard on test)
     train_transform = transforms.Compose([

@@ -35,6 +35,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 from ripser import ripser
+from persim import wasserstein
+
 from models import SimCLR
 
 import torch
@@ -153,76 +155,18 @@ def get_color_distortion(s=0.5):
 # -------------------------
 # PH featurizer (ripser CPU; detached)
 # -------------------------
-class SoftPersistenceImage(nn.Module):
+class PHDiagramFeaturizer(nn.Module):
     """
-    Diagram -> fixed vector via Gaussian bumps on (birth, persistence) grid.
-    Filters inf/NaN points.
+    feature map -> point cloud -> ripser diagrams (H0/H1)
+    Returns diagrams only (no vectorization).
     """
-    def __init__(self, grid_size=12, birth_range=(0.0, 4.0), pers_range=(0.0, 4.0), sigma=0.15):
+    def __init__(self, num_points=25, max_pts_per_dgm=64):
         super().__init__()
-        self.grid_size = int(grid_size)
-        self.birth_min, self.birth_max = birth_range
-        self.pers_min, self.pers_max = pers_range
-        self.sigma = float(sigma)
-
-        b = torch.linspace(self.birth_min, self.birth_max, self.grid_size)
-        p = torch.linspace(self.pers_min, self.pers_max, self.grid_size)
-        bb, pp = torch.meshgrid(b, p, indexing="ij")
-        centers = torch.stack([bb.reshape(-1), pp.reshape(-1)], dim=1)  # (G,2)
-        self.register_buffer("centers", centers)
-
-    def forward(self, diagram_bd: torch.Tensor) -> torch.Tensor:
-        if diagram_bd.numel() == 0:
-            return diagram_bd.new_zeros(self.centers.shape[0])
-
-        mask = torch.isfinite(diagram_bd).all(dim=1)
-        diagram_bd = diagram_bd[mask]
-        if diagram_bd.numel() == 0:
-            return diagram_bd.new_zeros(self.centers.shape[0])
-
-        birth = diagram_bd[:, 0]
-        death = diagram_bd[:, 1]
-        pers = (death - birth).clamp(min=0.0)
-        pts = torch.stack([birth, pers], dim=1)  # (M,2)
-
-        diff = pts[:, None, :] - self.centers[None, :, :]              # (M,G,2)
-        dist2 = (diff ** 2).sum(dim=2)                                 # (M,G)
-        bumps = torch.exp(-dist2 / (2 * self.sigma * self.sigma))      # (M,G)
-
-        feat = (bumps * pers[:, None]).sum(dim=0)  # (G,)
-        return feat
-
-
-class PHFeaturizer(nn.Module):
-    """
-    feature map -> point cloud -> ripser diagrams -> persistence image -> projected PH vector
-
-    NOTE: ripser is CPU + non-differentiable. We explicitly detach before ripser.
-    """
-    def __init__(
-        self,
-        out_dim=128,
-        num_points=25,
-        pi_grid=12,
-        sigma=0.15,
-        birth_range=(0.0, 4.0),
-        pers_range=(0.0, 4.0),
-    ):
-        super().__init__()
-        self.out_dim = int(out_dim)
         self.num_points = int(num_points) if num_points is not None else None
-
-        self.pi = SoftPersistenceImage(
-            grid_size=int(pi_grid),
-            birth_range=birth_range,
-            pers_range=pers_range,
-            sigma=float(sigma),
-        )
-        raw_dim = int(pi_grid) * int(pi_grid)
-        self.proj = nn.Linear(2 * raw_dim, self.out_dim)  # concat(H0 PI, H1 PI)
+        self.max_pts_per_dgm = int(max_pts_per_dgm)
 
     def _to_pointcloud(self, h_map_small: torch.Tensor) -> torch.Tensor:
-        # (B,C,H,W) -> (B,N,C) with N=H*W
+        # (B,C,H,W) -> (B,N,C)
         B, C, H, W = h_map_small.shape
         pts = h_map_small.permute(0, 2, 3, 1).reshape(B, H * W, C)
         N = H * W
@@ -237,34 +181,59 @@ class PHFeaturizer(nn.Module):
         x = x / (x.std(axis=0, keepdims=True) + 1e-6)
         return x.astype(np.float32)
 
-    def _vr_persistence(self, pts: torch.Tensor, hom_dim: int) -> torch.Tensor:
-        # Detach and move to CPU for ripser
-        pts_np = pts.detach().cpu().numpy().astype(np.float32)
+    @staticmethod
+    def _sanitize_dgm_np(dgm: np.ndarray) -> np.ndarray:
+        """
+        Keep only finite points with death > birth.
+        """
+        if dgm is None or dgm.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        dgm = dgm.astype(np.float32, copy=False)
+        mask = np.isfinite(dgm).all(axis=1)
+        dgm = dgm[mask]
+        if dgm.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        # remove zero/negative persistence points (optional but usually stabilizes)
+        pers = dgm[:, 1] - dgm[:, 0]
+        dgm = dgm[pers > 1e-8]
+        if dgm.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        return dgm
+
+    def _cap_points(self, dgm: np.ndarray) -> np.ndarray:
+        """
+        Keep top-K points by persistence to reduce Wasserstein cost.
+        """
+        if dgm.shape[0] <= self.max_pts_per_dgm:
+            return dgm
+        pers = dgm[:, 1] - dgm[:, 0]
+        idx = np.argsort(-pers)[: self.max_pts_per_dgm]
+        return dgm[idx]
+
+    def _vr_persistence_np(self, pts: torch.Tensor, hom_dim: int) -> np.ndarray:
+        # Detach -> CPU -> ripser
+        pts_np = pts.detach().cpu().numpy().astype(np.float32, copy=False)
         pts_np = self._standardize_np(pts_np)
 
         dgms = ripser(pts_np, maxdim=1)["dgms"]
         dgm = dgms[hom_dim]
-        if dgm.size == 0:
-            return pts.new_zeros((0, 2))
-        return torch.from_numpy(dgm).to(device=pts.device, dtype=pts.dtype)
+        dgm = self._sanitize_dgm_np(dgm)
+        dgm = self._cap_points(dgm)
+        return dgm
 
-    def forward(self, h_map_small: torch.Tensor) -> torch.Tensor:
+    def forward(self, h_map_small: torch.Tensor):
+        """
+        Returns:
+          dgms0: list length B, each is (n_i,2) np.ndarray for H0
+          dgms1: list length B, each is (m_i,2) np.ndarray for H1
+        """
         pts_batch = self._to_pointcloud(h_map_small)  # (B,N,C)
-        feats = []
+        dgms0, dgms1 = [], []
         for b in range(pts_batch.size(0)):
             pts = pts_batch[b]  # (N,C)
-
-            d0 = self._vr_persistence(pts, hom_dim=0)
-            f0 = self.pi(d0)
-
-            d1 = self._vr_persistence(pts, hom_dim=1)
-            f1 = self.pi(d1)
-
-            feats.append(torch.cat([f0, f1], dim=0))
-
-        feats = torch.stack(feats, dim=0)  # (B, 2*raw_dim)
-        feats = feats / (feats.norm(dim=1, keepdim=True) + 1e-8)
-        return self.proj(feats)            # (B, out_dim)
+            dgms0.append(self._vr_persistence_np(pts, hom_dim=0))
+            dgms1.append(self._vr_persistence_np(pts, hom_dim=1))
+        return dgms0, dgms1
 
 
 # -------------------------
@@ -288,6 +257,37 @@ def sim_matrix(x: torch.Tensor, t=0.5) -> torch.Tensor:
     s = s / t
     s = s - torch.eye(s.size(0), device=s.device) * 1e5
     return s
+
+
+def ph_wasserstein_logits(
+    dgms0,
+    dgms1,
+    order=1,
+    tau_logits=1.0,
+    w_h0=0.5,
+    w_h1=1.0,
+):
+    """
+    Build teacher logits S_ph (N,N) from Wasserstein distances.
+    Higher logits => more similar.
+
+    logits[i,j] = -(w_h0 * W(d0_i,d0_j) + w_h1 * W(d1_i,d1_j)) / tau_logits
+    """
+    N = len(dgms0)
+    S = np.zeros((N, N), dtype=np.float32)
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            d0 = wasserstein(dgms0[i], dgms0[j], matching=False)
+            d1 = wasserstein(dgms1[i], dgms1[j], matching=False)
+            d  = float(w_h0) * float(d0) + float(w_h1) * float(d1)
+            sij = -d / max(float(tau_logits), 1e-12)
+            S[i, j] = sij
+            S[j, i] = sij
+
+    # mask diagonal to be very negative (like your sim_matrix)
+    np.fill_diagonal(S, -1e5)
+    return torch.from_numpy(S)
 
 
 def _soft_targets_from_sim(sim_logits: torch.Tensor, tau: float, topk: Optional[int] = None) -> torch.Tensor:
@@ -324,47 +324,30 @@ def mse_sim_alignment(rep: torch.Tensor, ph_vec: torch.Tensor) -> torch.Tensor:
     mask = ~torch.eye(N, dtype=torch.bool, device=rep.device)
     return F.mse_loss(S_rep[mask], S_ph[mask])
 
-
-def ph_guided_contrastive(
+def ph_guided_contrastive_from_logits(
     rep: torch.Tensor,
-    ph_vec: torch.Tensor,
+    S_ph_logits: torch.Tensor,
     tau_student: float,
     tau_ph: float,
     topk: Optional[int] = None,
-    learn_ph_proj: bool = True,
-    align_w: float = 0.0,
 ) -> torch.Tensor:
     """
-    PH defines soft neighbors; rep learns to match them via cross-entropy.
+    PH defines soft neighbors via teacher logits S_ph_logits (N,N).
+    Student uses rep similarities, and matches teacher soft targets.
 
     rep: (N,d) differentiable
-    ph_vec: (N,d') comes from PHFeaturizer; ripser part is detached by construction.
-    topk: sparsify PH targets
-    learn_ph_proj: if False, blocks gradients into ph_vec (and thus into ph_featurizer.proj)
-    align_w: weight for similarity alignment auxiliary term (0 disables)
+    S_ph_logits: (N,N) teacher logits (higher more similar), diagonal masked already
     """
-    # Student logits (differentiable)
+    # Student logits
     S_rep = sim_matrix(rep, t=tau_student)
 
-    if not learn_ph_proj:
-        ph_vec = ph_vec.detach()
-
-    # Targets from a detached copy (PH target neighborhoods fixed for student optimization)
-    ph_vec_tgt = ph_vec.detach()
-    ph_vec_tgt = ph_vec_tgt / (ph_vec_tgt.norm(dim=1, keepdim=True) + 1e-8)
-    S_ph = (ph_vec_tgt @ ph_vec_tgt.t()).clamp(min=1e-7)
-    S_ph = S_ph - torch.eye(S_ph.size(0), device=S_ph.device) * 1e5
-    P_ph = _soft_targets_from_sim(S_ph, tau=tau_ph, topk=topk)
+    # Teacher targets (detach!)
+    S_ph_logits = S_ph_logits.to(device=rep.device, dtype=rep.dtype).detach()
+    P_ph = _soft_targets_from_sim(S_ph_logits, tau=tau_ph, topk=topk)
 
     logQ = F.log_softmax(S_rep, dim=1)
     loss = -(P_ph * logQ).sum(dim=1).mean()
-
-    # Optional: make ph_featurizer.proj actually learn a meaningful geometry
-    if learn_ph_proj and align_w > 0.0:
-        loss = loss + float(align_w) * mse_sim_alignment(rep, ph_vec)
-
     return loss
-
 
 # -------------------------
 # Train
@@ -430,13 +413,9 @@ def train(args: DictConfig) -> None:
         cifar_no_maxpool=True,   # IMPORTANT for PH on CIFAR
     ).to(device)
 
-    ph_featurizer = PHFeaturizer(
-        out_dim=int(args.projection_dim),
+    ph_featurizer = PHDiagramFeaturizer(
         num_points=int(args.ph.num_points),
-        pi_grid=int(args.ph.pi_grid),
-        sigma=float(args.ph.pi_sigma),
-        birth_range=(float(args.ph.birth_min), float(args.ph.birth_max)),
-        pers_range=(float(args.ph.pers_min), float(args.ph.pers_max)),
+        max_pts_per_dgm=int(getattr(args.ph, "max_pts_per_dgm", 64)),
     ).to(device)
 
     logger.info(f"Base model: {args.backbone}")
@@ -445,13 +424,12 @@ def train(args: DictConfig) -> None:
 
     # Optimizer: train backbone+projector AND (optionally useful) PH projection head
     optimizer = torch.optim.SGD(
-        list(model.parameters()) + list(ph_featurizer.proj.parameters()),
+        list(model.parameters()),
         float(args.learning_rate),
         momentum=float(args.momentum),
         weight_decay=float(args.weight_decay),
         nesterov=True
     )
-
     # Scheduler: correct LambdaLR multiplier behavior
     max_steps = int(args.train.max_steps) if int(args.train.max_steps) > 0 else None
     steps_per_epoch = min(len(train_loader), max_steps) if max_steps is not None else len(train_loader)
@@ -505,31 +483,46 @@ def train(args: DictConfig) -> None:
                 loss = nt_xent(rep, temperature)
 
             elif method_eff == "phsim":
-                ph_vec = ph_featurizer(h_map_small)
-                loss = ph_guided_contrastive(
+                dgms0, dgms1 = ph_featurizer(h_map_small)
+
+                S_ph = ph_wasserstein_logits(
+                    dgms0, dgms1,
+                    order=int(getattr(args.ph, "wasserstein_p", 1)),
+                    tau_logits=float(getattr(args.ph, "wasserstein_tau", 1.0)),
+                    w_h0=float(getattr(args.ph, "w_h0", 0.5)),
+                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
+                )
+
+                loss = ph_guided_contrastive_from_logits(
                     rep=rep,
-                    ph_vec=ph_vec,
+                    S_ph_logits=S_ph,
                     tau_student=tau_student,
                     tau_ph=tau_ph,
                     topk=ph_topk,
-                    learn_ph_proj=(align_w > 0.0),
-                    align_w=align_w,
                 )
 
             elif method_eff == "hybrid":
                 alpha = float(args.loss.alpha)
                 loss_cos = nt_xent(rep, temperature)
 
-                ph_vec = ph_featurizer(h_map_small)
-                loss_phsim = ph_guided_contrastive(
+                dgms0, dgms1 = ph_featurizer(h_map_small)
+
+                S_ph = ph_wasserstein_logits(
+                    dgms0, dgms1,
+                    order=int(getattr(args.ph, "wasserstein_p", 1)),
+                    tau_logits=float(getattr(args.ph, "wasserstein_tau", 1.0)),
+                    w_h0=float(getattr(args.ph, "w_h0", 0.5)),
+                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
+                )
+
+                loss_phsim = ph_guided_contrastive_from_logits(
                     rep=rep,
-                    ph_vec=ph_vec,
+                    S_ph_logits=S_ph,
                     tau_student=tau_student,
                     tau_ph=tau_ph,
                     topk=ph_topk,
-                    learn_ph_proj=(align_w > 0.0),
-                    align_w=align_w,
                 )
+
                 loss = alpha * loss_cos + (1.0 - alpha) * loss_phsim
 
             else:

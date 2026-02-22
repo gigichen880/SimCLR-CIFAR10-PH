@@ -30,7 +30,7 @@ method: baseline
 
 train:
   max_steps: 50        # set -1 for full epoch
-  warmup_epochs: 2     # baseline warmup even if method=phsim/hybrid
+  warmup_epochs: 0     # baseline warmup even if method=phsim/hybrid
 
 optim:
   lr_min: 1e-3
@@ -57,6 +57,11 @@ ph:
   birth_max: 4.0
   pers_min: 0.0
   pers_max: 4.0
+  max_pts_per_dgm: 64
+  wasserstein_p: 1
+  wasserstein_tau: 1.0
+  w_h0: 0.5
+  w_h1: 1.0
 
 # ==============================
 # Loss configuration
@@ -67,10 +72,10 @@ loss:
   alpha: 0.9
 
   # for phsim / hybrid
-  teacher_temperature: 0.3   # PH soft-target temperature (sharper targets help)
-  student_temperature: 0.2   # rep similarity temperature
+  teacher_temperature: 0.07   # PH soft-target temperature (sharper targets help)
+  student_temperature: 0.5   # rep similarity temperature
 
-  ph_topk: 20                # top-k neighbors for PH targets (0 disables)
+  ph_topk: 10                # top-k neighbors for PH targets (0 disables)
   ph_proj_align: 0.05        # similarity alignment weight (0 disables)
 
 # ==============================
@@ -79,3 +84,4 @@ loss:
 
 finetune_epochs: 10
 load_epoch: 10
+
