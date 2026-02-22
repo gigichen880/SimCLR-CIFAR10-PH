@@ -59,10 +59,10 @@ ph:
   pers_max: 4.0
   max_pts_per_dgm: 64
   wasserstein_p: 1
-  wasserstein_tau: 1.0
-  w_h0: 0.5
+  neg_k: 2              # try 1 / 2 / 4
+  wasserstein_tau: 1.0  # scale for distance->teacher logits
+  w_h0: 0.2
   w_h1: 1.0
-
 # ==============================
 # Loss configuration
 # ==============================
@@ -72,7 +72,7 @@ loss:
   alpha: 0.9
 
   # for phsim / hybrid
-  teacher_temperature: 0.07   # PH soft-target temperature (sharper targets help)
+  teacher_temperature: 0.3   # PH soft-target temperature
   student_temperature: 0.5   # rep similarity temperature
 
   ph_topk: 10                # top-k neighbors for PH targets (0 disables)

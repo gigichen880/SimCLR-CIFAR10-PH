@@ -92,7 +92,7 @@ class HistoryLogger:
         plt.plot(epochs, test_losses, label="test")
         plt.xlabel("epoch")
         plt.ylabel("loss")
-        plt.title("Linear Eval Loss")
+        plt.title(f"Linear Eval Loss ({tag})")
         plt.legend()
         plt.savefig(os.path.join(self.out_dir, f"lin_loss_{tag}.png"), dpi=150)
         plt.close()
@@ -102,7 +102,7 @@ class HistoryLogger:
         plt.plot(epochs, test_accs, label="test")
         plt.xlabel("epoch")
         plt.ylabel("accuracy")
-        plt.title("Linear Eval Accuracy")
+        plt.title(f"Linear Eval Accuracy ({tag})")
         plt.legend()
         plt.savefig(os.path.join(self.out_dir, f"lin_acc_{tag}.png"), dpi=150)
         plt.close()
@@ -212,8 +212,8 @@ def finetune(args: DictConfig) -> None:
     # Hydra run dir for outputs
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints")
-    viz_dir = os.path.join(out_dir, "visuals")
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "downstream")
+    viz_dir = os.path.join(out_dir, "visuals", "downstream")
 
     ensure_dir(ckpt_dir)
     ensure_dir(viz_dir)
@@ -265,7 +265,7 @@ def finetune(args: DictConfig) -> None:
     ).to(device)
 
     # Load checkpoint produced by simclr.py
-    ckpt_path = f"checkpoints/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
+    ckpt_path = f"checkpoints/upstream/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"

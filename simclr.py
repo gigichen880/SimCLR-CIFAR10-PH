@@ -171,7 +171,8 @@ class PHDiagramFeaturizer(nn.Module):
         pts = h_map_small.permute(0, 2, 3, 1).reshape(B, H * W, C)
         N = H * W
         if self.num_points is not None and self.num_points < N:
-            idx = torch.randperm(N, device=h_map_small.device)[: self.num_points]
+            # idx = torch.randperm(N, device=h_map_small.device)[: self.num_points]
+            idx = torch.linspace(0, N - 1, steps=self.num_points, device=h_map_small.device).long()
             pts = pts[:, idx, :]
         return pts
 
@@ -324,30 +325,38 @@ def mse_sim_alignment(rep: torch.Tensor, ph_vec: torch.Tensor) -> torch.Tensor:
     mask = ~torch.eye(N, dtype=torch.bool, device=rep.device)
     return F.mse_loss(S_rep[mask], S_ph[mask])
 
-def ph_guided_contrastive_from_logits(
-    rep: torch.Tensor,
-    S_ph_logits: torch.Tensor,
-    tau_student: float,
-    tau_ph: float,
-    topk: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    PH defines soft neighbors via teacher logits S_ph_logits (N,N).
-    Student uses rep similarities, and matches teacher soft targets.
+import random
 
-    rep: (N,d) differentiable
-    S_ph_logits: (N,N) teacher logits (higher more similar), diagonal masked already
-    """
-    # Student logits
-    S_rep = sim_matrix(rep, t=tau_student)
+def ph_rank_loss(rep, dgms0, dgms1, tau_student, neg_k=2, w_h0=0.0, w_h1=1.0, margin=0.2):
+    device = rep.device
+    N = rep.size(0)
+    rep_n = rep / (rep.norm(dim=1, keepdim=True) + 1e-8)
+    all_idx = list(range(N))
+    losses = []
 
-    # Teacher targets (detach!)
-    S_ph_logits = S_ph_logits.to(device=rep.device, dtype=rep.dtype).detach()
-    P_ph = _soft_targets_from_sim(S_ph_logits, tau=tau_ph, topk=topk)
+    for i in range(N):
+        j_pos = i + 1 if (i % 2 == 0) else i - 1
+        forbidden = {i, j_pos}
+        candidates = [j for j in all_idx if j not in forbidden]
+        negs = random.sample(candidates, k=min(neg_k, len(candidates)))
 
-    logQ = F.log_softmax(S_rep, dim=1)
-    loss = -(P_ph * logQ).sum(dim=1).mean()
-    return loss
+        # student sims
+        s_pos = (rep_n[i] * rep_n[j_pos]).sum()
+        s_negs = torch.stack([(rep_n[i] * rep_n[j]).sum() for j in negs])
+
+        # teacher chooses hardest negative = smallest PH distance
+        d_negs = []
+        for j in negs:
+            d0 = wasserstein(dgms0[i], dgms0[j], matching=False) if w_h0 != 0.0 else 0.0
+            d1 = wasserstein(dgms1[i], dgms1[j], matching=False) if w_h1 != 0.0 else 0.0
+            d_negs.append(float(w_h0)*float(d0) + float(w_h1)*float(d1))
+        j_hard = int(np.argmin(np.array(d_negs, dtype=np.float32)))
+        s_neg = s_negs[j_hard]
+
+        # margin hinge
+        losses.append(F.relu(margin - (s_pos - s_neg)))
+
+    return torch.stack(losses).mean()
 
 # -------------------------
 # Train
@@ -372,10 +381,10 @@ def train(args: DictConfig) -> None:
     # Hydra run dir
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "upstream")
     ensure_dir(ckpt_dir)
 
-    viz_dir = os.path.join(out_dir, "visuals")
+    viz_dir = os.path.join(out_dir, "visuals", "upstream")
     ensure_dir(viz_dir)
     hist = HistoryLogger(out_dir=viz_dir) 
 
@@ -485,20 +494,14 @@ def train(args: DictConfig) -> None:
             elif method_eff == "phsim":
                 dgms0, dgms1 = ph_featurizer(h_map_small)
 
-                S_ph = ph_wasserstein_logits(
-                    dgms0, dgms1,
-                    order=int(getattr(args.ph, "wasserstein_p", 1)),
-                    tau_logits=float(getattr(args.ph, "wasserstein_tau", 1.0)),
-                    w_h0=float(getattr(args.ph, "w_h0", 0.5)),
-                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
-                )
-
-                loss = ph_guided_contrastive_from_logits(
+                loss = ph_rank_loss(
                     rep=rep,
-                    S_ph_logits=S_ph,
+                    dgms0=dgms0,
+                    dgms1=dgms1,
                     tau_student=tau_student,
-                    tau_ph=tau_ph,
-                    topk=ph_topk,
+                    neg_k=int(getattr(args.ph, "neg_k", 2)),
+                    w_h0=float(getattr(args.ph, "w_h0", 0.0)),
+                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
                 )
 
             elif method_eff == "hybrid":
@@ -507,23 +510,17 @@ def train(args: DictConfig) -> None:
 
                 dgms0, dgms1 = ph_featurizer(h_map_small)
 
-                S_ph = ph_wasserstein_logits(
-                    dgms0, dgms1,
-                    order=int(getattr(args.ph, "wasserstein_p", 1)),
-                    tau_logits=float(getattr(args.ph, "wasserstein_tau", 1.0)),
-                    w_h0=float(getattr(args.ph, "w_h0", 0.5)),
+                loss_ph = ph_rank_loss(
+                    rep=rep,
+                    dgms0=dgms0,
+                    dgms1=dgms1,
+                    tau_student=tau_student,
+                    neg_k=int(getattr(args.ph, "neg_k", 2)),
+                    w_h0=float(getattr(args.ph, "w_h0", 0.0)),
                     w_h1=float(getattr(args.ph, "w_h1", 1.0)),
                 )
 
-                loss_phsim = ph_guided_contrastive_from_logits(
-                    rep=rep,
-                    S_ph_logits=S_ph,
-                    tau_student=tau_student,
-                    tau_ph=tau_ph,
-                    topk=ph_topk,
-                )
-
-                loss = alpha * loss_cos + (1.0 - alpha) * loss_phsim
+                loss = alpha * loss_cos + (1.0 - alpha) * loss_ph
 
             else:
                 raise ValueError(f"Unknown method={args.method}. Use baseline|phsim|hybrid.")
