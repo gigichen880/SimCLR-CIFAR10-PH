@@ -1,21 +1,10 @@
 """
 simclr.py
 
-Goal:
-- Use Persistent Homology (PH) ONLY to define a similarity / neighborhood structure.
-- Train the backbone with gradient descent by matching rep-similarities to PH-defined soft targets.
-- We do NOT backprop through ripser / PH computation itself.
-
 Methods (yaml / CLI):
   - method=baseline : standard SimCLR NT-Xent on rep
   - method=phsim    : PH-guided contrastive (PH defines soft positives; reps learn them)
   - method=hybrid   : alpha*baseline + (1-alpha)*phsim
-
-Key stability improvements:
-- Warmup: run baseline for first K epochs even if method=phsim/hybrid
-- Top-k PH neighbors: sparsify PH targets per row (renormalize)
-- Optional PH projection learning via a small similarity-alignment auxiliary loss
-- Correct cosine LR scheduling with LambdaLR multiplier
 
 Run examples:
   python simclr.py backbone=resnet18 method=baseline
@@ -26,7 +15,6 @@ Run examples:
 import os
 import csv
 import matplotlib.pyplot as plt
-
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import logging
@@ -37,8 +25,7 @@ from PIL import Image
 from ripser import ripser
 from persim import wasserstein
 
-from models import SimCLR
-
+import itertools
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -50,11 +37,12 @@ from torchvision.models import resnet18, resnet34
 from torchvision import transforms
 from tqdm import tqdm
 
+from models import SimCLR
+
 logger = logging.getLogger(__name__)
 
 import warnings
 warnings.simplefilter("ignore", UserWarning)
-
 
 # -------------------------
 # Utilities
@@ -90,13 +78,13 @@ class HistoryLogger:
         self.rows = []
         with open(self.csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["epoch", "loss", "lr"])
+            w.writerow(["epoch", "loss", "lr", "gamma"])
 
-    def log_epoch(self, epoch: int, loss: float, lr: float):
-        self.rows.append((epoch, loss, lr))
+    def log_epoch(self, epoch: int, loss: float, lr: float, gamma: float = 1.0):
+        self.rows.append((epoch, loss, lr, gamma))
         with open(self.csv_path, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([epoch, loss, lr])
+            w.writerow([epoch, loss, lr, gamma])
 
     def plot(self, tag):
         if not self.rows:
@@ -104,12 +92,13 @@ class HistoryLogger:
         epochs = [r[0] for r in self.rows]
         losses = [r[1] for r in self.rows]
         lrs = [r[2] for r in self.rows]
+        gammas = [r[3] for r in self.rows]
 
         plt.figure()
         plt.plot(epochs, losses)
         plt.xlabel("epoch")
         plt.ylabel("train loss")
-        plt.title("Train Loss")
+        plt.title(f"Train Loss ({tag})")
         plt.savefig(os.path.join(self.out_dir, f"loss_{tag}.png"), dpi=150)
         plt.close()
 
@@ -117,32 +106,116 @@ class HistoryLogger:
         plt.plot(epochs, lrs)
         plt.xlabel("epoch")
         plt.ylabel("learning rate")
-        plt.title("Learning Rate")
-        plt.savefig(os.path.join(self.out_dir, f"loss_{tag}.png"), dpi=150)
+        plt.title(f"Learning Rate ({tag})")
+        plt.savefig(os.path.join(self.out_dir, f"lr_{tag}.png"), dpi=150)
         plt.close()
 
+        plt.figure()
+        plt.plot(epochs, gammas)
+        plt.xlabel("epoch")
+        plt.ylabel("Gamma (PH separation)")
+        plt.title(f"Topological Separation Γ vs Epoch ({tag})")
+        plt.savefig(os.path.join(self.out_dir, f"gamma_{tag}.png"), dpi=150)
+        plt.close()
 
-class CIFAR10Pair(CIFAR10):
-    """Generate mini-batch pairs on CIFAR10 training set."""
-    def __getitem__(self, idx):
-        img, target = self.data[idx], self.targets[idx]
-        img = Image.fromarray(img)
-        imgs = [self.transform(img), self.transform(img)]
-        return torch.stack(imgs), target  # (2,C,H,W), y
+def _sanitize_dgm_np(dgm: np.ndarray) -> np.ndarray:
+    """Keep only finite off-diagonal points with positive persistence."""
+    if dgm is None or dgm.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    dgm = dgm.astype(np.float32, copy=False)
+    mask = np.isfinite(dgm).all(axis=1)
+    dgm = dgm[mask]
+    if dgm.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    pers = dgm[:, 1] - dgm[:, 0]
+    dgm = dgm[pers > 1e-8]
+    if dgm.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return dgm
 
+def _standardize_np(x: np.ndarray) -> np.ndarray:
+    x = x - x.mean(axis=0, keepdims=True)
+    x = x / (x.std(axis=0, keepdims=True) + 1e-6)
+    return x.astype(np.float32)
+
+@torch.no_grad()
+def eval_gamma_class_separation(
+    model: nn.Module,
+    device: str,
+    data_dir: str,
+    per_class: int = 50,
+    batch_size: int = 256,
+    w_h0: float = 0.2,
+    w_h1: float = 1.0,
+    maxdim: int = 1,
+) -> float:
+    """
+    Evaluation-only proxy for Γ(f):
+    - Build a small labeled set from CIFAR10 test split (per_class examples per class).
+    - Compute pooled features h for each example.
+    - For each class, compute persistence diagrams (H0/H1) on the class point cloud in feature space.
+    - Return average weighted Wasserstein distance over all class pairs.
+    """
+    # deterministic / light transform for eval
+    test_transform = transforms.Compose([transforms.ToTensor()])
+    test_set = CIFAR10(root=data_dir, train=False, transform=test_transform, download=True)
+
+    # pick per_class indices for each label
+    idx_by_class = {c: [] for c in range(10)}
+    for idx in range(len(test_set)):
+        _, y = test_set[idx]
+        if len(idx_by_class[y]) < per_class:
+            idx_by_class[y].append(idx)
+        if all(len(v) >= per_class for v in idx_by_class.values()):
+            break
+
+    indices = [i for c in range(10) for i in idx_by_class[c]]
+    subset = Subset(test_set, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # collect features by class
+    feats = {c: [] for c in range(10)}
+    model.eval()
+    for x, y in loader:
+        x = x.to(device)
+        y = y.numpy()
+        _, h, _ = model(x)  # use pooled backbone feature h
+        h_np = h.detach().cpu().numpy().astype(np.float32)
+        for i, c in enumerate(y):
+            feats[int(c)].append(h_np[i])
+
+    # compute persistence diagrams per class
+    dgms0 = {}
+    dgms1 = {}
+    for c in range(10):
+        Xc = np.stack(feats[c], axis=0)
+        Xc = _standardize_np(Xc)
+        dgms = ripser(Xc, maxdim=maxdim)["dgms"]
+        d0 = _sanitize_dgm_np(dgms[0])
+        d1 = _sanitize_dgm_np(dgms[1]) if len(dgms) > 1 else np.zeros((0, 2), dtype=np.float32)
+        dgms0[c] = d0
+        dgms1[c] = d1
+
+    # average inter-class distance
+    dists = []
+    for a, b in itertools.combinations(range(10), 2):
+        d0 = wasserstein(dgms0[a], dgms0[b], matching=False)
+        d1 = wasserstein(dgms1[a], dgms1[b], matching=False)
+        d = float(w_h0) * float(d0) + float(w_h1) * float(d1)
+        dists.append(d)
+
+    return float(np.mean(dists)) if dists else 0.0
 
 def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def get_lr(step: int, total_steps: int, lr_max: float, lr_min: float) -> float:
     """Cosine annealing schedule: returns ABSOLUTE lr."""
     if total_steps <= 1:
         return lr_min
     return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.cos(step / total_steps * np.pi))
-
 
 def get_color_distortion(s=0.5):
     """Color distortion = color jitter + grayscale (SimCLR appendix)."""
@@ -151,6 +224,16 @@ def get_color_distortion(s=0.5):
     rnd_gray = transforms.RandomGrayscale(p=0.2)
     return transforms.Compose([rnd_color_jitter, rnd_gray])
 
+# -------------------------
+# Dataloader
+# -------------------------
+class CIFAR10Pair(CIFAR10):
+    """Generate mini-batch pairs on CIFAR10 training set."""
+    def __getitem__(self, idx):
+        img, target = self.data[idx], self.targets[idx]
+        img = Image.fromarray(img)
+        imgs = [self.transform(img), self.transform(img)]
+        return torch.stack(imgs), target  # (2,C,H,W), y
 
 # -------------------------
 # PH featurizer (ripser CPU; detached)
@@ -251,14 +334,12 @@ def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
     targets[1::2] -= 1
     return F.cross_entropy(sim, targets.long())
 
-
 def sim_matrix(x: torch.Tensor, t=0.5) -> torch.Tensor:
     x = x / (x.norm(dim=1, keepdim=True) + 1e-8)
     s = (x @ x.t()).clamp(min=1e-7)
     s = s / t
     s = s - torch.eye(s.size(0), device=s.device) * 1e5
     return s
-
 
 def ph_wasserstein_logits(
     dgms0,
@@ -289,26 +370,6 @@ def ph_wasserstein_logits(
     # mask diagonal to be very negative (like your sim_matrix)
     np.fill_diagonal(S, -1e5)
     return torch.from_numpy(S)
-
-
-def _soft_targets_from_sim(sim_logits: torch.Tensor, tau: float, topk: Optional[int] = None) -> torch.Tensor:
-    """
-    sim_logits: (N,N), higher means more similar. diagonal should already be masked/very negative.
-    tau: temperature for targets
-    topk: if not None, keep only top-k logits per row (excluding diagonal), renormalize.
-    """
-    N = sim_logits.size(0)
-    mask = ~torch.eye(N, dtype=torch.bool, device=sim_logits.device)
-    logits = (sim_logits / tau).masked_fill(~mask, -1e9)  # (N,N)
-
-    if topk is not None and topk > 0 and topk < (N - 1):
-        vals, idx = torch.topk(logits, k=topk, dim=1)
-        sparse = logits.new_full(logits.shape, -1e9)
-        sparse.scatter_(1, idx, vals)
-        logits = sparse
-
-    return F.softmax(logits, dim=1)
-
 
 def mse_sim_alignment(rep: torch.Tensor, ph_vec: torch.Tensor) -> torch.Tensor:
     """
@@ -549,7 +610,21 @@ def train(args: DictConfig) -> None:
         tag = f"{args.method}_{args.backbone}"
         if int(args.seed) != 0:
             tag += f"_seed{args.seed}"
-        hist.log_epoch(epoch, loss_meter.avg, current_lr)
+
+        # ---  Γ(f) evaluation ---
+        gamma = eval_gamma_class_separation(
+            model=model,
+            device=device,
+            data_dir=data_dir,
+            per_class=int(getattr(args.eval, "gamma_per_class", 50)),
+            batch_size=int(getattr(args.eval, "gamma_batch_size", 256)),
+            w_h0=float(getattr(args.ph, "w_h0", 0.2)),
+            w_h1=float(getattr(args.ph, "w_h1", 1.0)),
+            maxdim=1,
+        )
+        model.train() 
+        ph_featurizer.train()
+        hist.log_epoch(epoch, loss_meter.avg, current_lr, gamma)
         hist.plot(tag=tag)
 
 

@@ -1,36 +1,10 @@
 """
-simclr_lin.py (updated to match your latest SimCLR + PH pipeline)
-
-What this script does:
-- Loads the checkpoint produced by simclr.py (baseline / phsim / hybrid)
-- Builds a linear classifier on top of the *frozen encoder features*
-- Trains only the linear layer (linear evaluation protocol)
-
-Key updates vs your old version:
-1) Matches checkpoint format from your updated simclr.py:
-   - simclr.py saves: {"model": ..., "ph_featurizer": ..., "config": ...}
-   - We now load state["model"] into the SimCLR model.
-
-2) Uses the correct "encoder feature" output:
-   - Your SimCLR class does NOT expose pre_model.enc.
-   - Instead, SimCLR.forward returns (_, h, rep), where:
-       h = pooled backbone feature (B, feature_dim)
-   - For linear eval we train on h (NOT rep).
-
-3) Keeps CIFAR stem consistent:
-   - simclr.py used cifar_no_maxpool=True to avoid 1x1 maps.
-   - We construct SimCLR the same way here.
-
-4) Adds CSV + plots (loss/acc curves) in Hydra run dir, like simclr.py.
+simclr_lin.py
 
 Run examples:
   python simclr_lin.py backbone=resnet18 method=baseline load_epoch=10
   python simclr_lin.py backbone=resnet18 method=phsim    load_epoch=10
   python simclr_lin.py backbone=resnet18 method=hybrid   load_epoch=10
-
-Notes:
-- For "linear evaluation" you typically use NO heavy augmentations; I keep it simple.
-- Uses a small labeled subset by default (like your original): 10 samples per class.
 """
 
 import os
@@ -56,11 +30,10 @@ from models import SimCLR
 logger = logging.getLogger(__name__)
 
 # -------------------------
-# small utils: history logging + plots
+# Utilities
 # -------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
-
 
 class HistoryLogger:
     def __init__(self, out_dir: str, filename: str = "lin_history.csv"):
@@ -70,13 +43,13 @@ class HistoryLogger:
         self.rows = []
         with open(self.csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["epoch", "train_loss", "train_acc", "test_loss", "test_acc", "lr"])
+            w.writerow(["epoch", "train_loss", "train_acc", "test_loss", "test_acc", "pgd_acc", "lr"])
 
-    def log_epoch(self, epoch, train_loss, train_acc, test_loss, test_acc, lr):
-        self.rows.append((epoch, train_loss, train_acc, test_loss, test_acc, lr))
+    def log_epoch(self, epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr):
+        self.rows.append((epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr))
         with open(self.csv_path, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([epoch, train_loss, train_acc, test_loss, test_acc, lr])
+            w.writerow([epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr])
 
     def plot(self, tag):
         if not self.rows:
@@ -86,6 +59,7 @@ class HistoryLogger:
         train_accs = [r[2] for r in self.rows]
         test_losses = [r[3] for r in self.rows]
         test_accs = [r[4] for r in self.rows]
+        pgd_accs = [r[5] for r in self.rows]
 
         plt.figure()
         plt.plot(epochs, train_losses, label="train")
@@ -107,6 +81,54 @@ class HistoryLogger:
         plt.savefig(os.path.join(self.out_dir, f"lin_acc_{tag}.png"), dpi=150)
         plt.close()
 
+        plt.figure()
+        plt.plot(epochs, test_accs, label="clean test")
+        plt.plot(epochs, pgd_accs, label="PGD-10 test")
+        plt.xlabel("epoch")
+        plt.ylabel("accuracy")
+        plt.title(f"Robust Accuracy ({tag})")
+        plt.legend()
+        plt.savefig(os.path.join(self.out_dir, f"lin_robust_{tag}.png"), dpi=150)
+        plt.close()
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return torch.clamp(x, lo, hi)
+
+# FGSM and PGD implementations adapted for adversarial attack evaluation 
+def fgsm_attack(model, x, y, eps, clamp_min=0.0, clamp_max=1.0):
+    x_adv = x.detach().clone().requires_grad_(True)
+    logits = model(x_adv)
+    loss = F.cross_entropy(logits, y)
+    model.zero_grad(set_to_none=True)
+    if x_adv.grad is not None:
+        x_adv.grad.zero_()
+    loss.backward()
+    with torch.no_grad():
+        x_adv = x_adv + eps * x_adv.grad.sign()
+        x_adv = _clamp(x_adv, clamp_min, clamp_max)
+    return x_adv.detach()
+
+def pgd_attack(model, x, y, eps, alpha, steps, random_start=True, clamp_min=0.0, clamp_max=1.0):
+    x0 = x.detach()
+    if random_start:
+        x_adv = x0 + torch.empty_like(x0).uniform_(-eps, eps)
+        x_adv = _clamp(x_adv, clamp_min, clamp_max)
+    else:
+        x_adv = x0.clone()
+
+    for _ in range(steps):
+        x_adv.requires_grad_(True)
+        logits = model(x_adv)
+        loss = F.cross_entropy(logits, y)
+        model.zero_grad(set_to_none=True)
+        if x_adv.grad is not None:
+            x_adv.grad.zero_()
+        loss.backward()
+        with torch.no_grad():
+            x_adv = x_adv + alpha * x_adv.grad.sign()
+            x_adv = torch.max(torch.min(x_adv, x0 + eps), x0 - eps)
+            x_adv = _clamp(x_adv, clamp_min, clamp_max)
+    return x_adv.detach()
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -197,6 +219,58 @@ def run_epoch(model, dataloader, epoch, device, optimizer=None, scheduler=None):
 
     return loss_meter.avg, acc_meter.avg
 
+def eval_adv_metrics(model, dataloader, device, attack_cfg):
+    model.eval()
+    eps = float(getattr(attack_cfg, "eps", 8/255))
+    do_fgsm = bool(getattr(attack_cfg, "fgsm", True))
+    do_pgd = bool(getattr(attack_cfg, "pgd", True))
+    steps = int(getattr(attack_cfg, "pgd_steps", 10))
+    alpha = float(getattr(attack_cfg, "pgd_alpha", 2/255))
+    rs = bool(getattr(attack_cfg, "pgd_random_start", True))
+    max_batches = int(getattr(attack_cfg, "max_test_batches", -1))
+
+    clean_correct = 0
+    fgsm_correct = 0
+    pgd_correct = 0
+    n = 0
+
+    pbar = tqdm(dataloader, desc="AdvEval", leave=False)
+    for bidx, (x, y) in enumerate(pbar):
+        if max_batches > 0 and bidx >= max_batches:
+            break
+
+        x = x.to(device, non_blocking=(device == "cuda"))
+        y = y.to(device, non_blocking=(device == "cuda"))
+        bs = x.size(0)
+        n += bs
+
+        with torch.no_grad():
+            logits = model(x)
+            clean_correct += (logits.argmax(1) == y).sum().item()
+
+        if do_fgsm:
+            x_f = fgsm_attack(model, x, y, eps=eps)
+            with torch.no_grad():
+                logits_f = model(x_f)
+                fgsm_correct += (logits_f.argmax(1) == y).sum().item()
+
+        if do_pgd:
+            x_p = pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps, random_start=rs)
+            with torch.no_grad():
+                logits_p = model(x_p)
+                pgd_correct += (logits_p.argmax(1) == y).sum().item()
+
+        msg = f"clean {clean_correct/n:.3f}"
+        if do_fgsm:
+            msg += f" | fgsm {fgsm_correct/n:.3f}"
+        if do_pgd:
+            msg += f" | pgd {pgd_correct/n:.3f}"
+        pbar.set_postfix_str(msg)
+
+    out = {"adv_clean_acc": clean_correct / max(1, n)}
+    out["adv_fgsm_acc"] = fgsm_correct / max(1, n) if do_fgsm else float("nan")
+    out["adv_pgd_acc"]  = pgd_correct / max(1, n) if do_pgd else float("nan")
+    return out
 
 @hydra.main(version_base=None, config_path=".", config_name="simclr_config")
 def finetune(args: DictConfig) -> None:
@@ -279,7 +353,6 @@ def finetune(args: DictConfig) -> None:
     if isinstance(ckpt, dict) and "model" in ckpt:
         pre_model.load_state_dict(ckpt["model"], strict=True)
     else:
-        # fallback if you saved raw state_dict by mistake
         pre_model.load_state_dict(ckpt, strict=True)
 
     # Freeze encoder (SimCLR model)
@@ -325,11 +398,18 @@ def finetune(args: DictConfig) -> None:
         train_loss, train_acc = run_epoch(model, train_loader, epoch, device, optimizer, scheduler)
         test_loss, test_acc = run_epoch(model, test_loader, epoch, device)
 
+        attack_cfg = getattr(args, "attack", None)
+        pgd_acc = float("nan")
+        if attack_cfg is not None and bool(getattr(attack_cfg, "enabled", False)):
+            adv = eval_adv_metrics(model, test_loader, device, attack_cfg)
+            pgd_acc = adv["adv_pgd_acc"]
+
         current_lr = optimizer.param_groups[0]["lr"]
         tag = f"{args.method}_{args.backbone}_bs{args.batch_size}"
         if int(args.seed) != 0:
             tag += f"_seed{args.seed}"
-        hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, current_lr)
+
+        hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, current_lr)
         hist.plot(tag=tag)
 
         if test_acc > best_test_acc:
