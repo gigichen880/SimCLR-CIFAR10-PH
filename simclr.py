@@ -442,12 +442,12 @@ def train(args: DictConfig) -> None:
     # Hydra run dir
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints", "upstream")
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "upstream", args.method)
     ensure_dir(ckpt_dir)
 
-    viz_dir = os.path.join(out_dir, "visuals", "upstream")
+    viz_dir = os.path.join(out_dir, "visuals", "upstream", args.method)
     ensure_dir(viz_dir)
-    hist = HistoryLogger(out_dir=viz_dir) 
+    hist = HistoryLogger(out_dir=viz_dir, filename=f"{args.method}_train_history.csv") 
 
     # Data
     train_transform = transforms.Compose([

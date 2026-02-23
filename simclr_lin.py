@@ -286,8 +286,8 @@ def finetune(args: DictConfig) -> None:
     # Hydra run dir for outputs
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints", "downstream")
-    viz_dir = os.path.join(out_dir, "visuals", "downstream")
+    ckpt_dir = os.path.join(out_dir, "checkpoints", args.method, "downstream")
+    viz_dir = os.path.join(out_dir, "visuals", args.method, "downstream")
 
     ensure_dir(ckpt_dir)
     ensure_dir(viz_dir)
@@ -339,7 +339,7 @@ def finetune(args: DictConfig) -> None:
     ).to(device)
 
     # Load checkpoint produced by simclr.py
-    ckpt_path = f"checkpoints/upstream/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
+    ckpt_path = f"checkpoints/upstream/{args.method}/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -417,7 +417,7 @@ def finetune(args: DictConfig) -> None:
             best_epoch = epoch
             logger.info("==> New best test acc")
             best_name = f"simclr_lin_{tag}_best.pth"
-            best_path = os.path.join(ckpt_dir, best_name)
+            best_path = os.path.join(ckpt_dir, args.method, best_name)
             torch.save(model.state_dict(), best_path)
 
     logger.info(f"Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")

@@ -45,7 +45,8 @@ python simclr.py method=hybrid loss.alpha=0.9 backbone=resnet18
 
 Linear evaluation:
 
-``python simclr_lin.py backbone=resnet18``
+``python simclr_lin.py backbone=resnet18 method=baseline load_epoch=10``
+``python simclr_lin.py backbone=resnet18 method=phsim load_epoch=10``
 
 The default ``batch_size`` is 512. All the hyperparameters are available in ``simclr_config.yml``,
  which could be overrided from the command line.
