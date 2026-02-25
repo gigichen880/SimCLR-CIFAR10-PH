@@ -1,5 +1,0 @@
-method,backbone,seed,upstream_epoch,gamma,pgd_acc_final,pgd_acc_best,best_test_acc,ckpt_path,lin_csv,up_hist_csv
-baseline,resnet18,0,2,21.696135974748454,0.0463,0.0463,0.1198,checkpoints/upstream/baseline/seed0/epoch2/simclr_baseline_resnet18_epoch2_seed0.pt,logs/downstream/baseline/seed0/lin_history_baseline_resnet18.csv,logs/upstream/baseline/seed0/baseline_seed0_train_history.csv
-baseline,resnet18,1,2,21.82875862530821,0.0975,0.1,0.1015,checkpoints/upstream/baseline/seed1/epoch2/simclr_baseline_resnet18_epoch2_seed1.pt,logs/downstream/baseline/seed1/lin_history_baseline_resnet18.csv,logs/upstream/baseline/seed1/baseline_seed1_train_history.csv
-phsim,resnet18,0,2,23.96622120687893,0.0476,0.0511,0.1013,checkpoints/upstream/phsim/seed0/epoch2/simclr_phsim_resnet18_epoch2_seed0.pt,logs/downstream/phsim/seed0/lin_history_phsim_resnet18.csv,logs/upstream/phsim/seed0/phsim_seed0_train_history.csv
-phsim,resnet18,1,2,25.20742321178104,0.0524,0.0524,0.1367,checkpoints/upstream/phsim/seed1/epoch2/simclr_phsim_resnet18_epoch2_seed1.pt,logs/downstream/phsim/seed1/lin_history_phsim_resnet18.csv,logs/upstream/phsim/seed1/phsim_seed1_train_history.csv
